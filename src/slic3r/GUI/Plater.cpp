@@ -4791,6 +4791,7 @@ struct Plater::priv
     bool PopupObjectTable(int object_id, int volume_id, const wxPoint& position);
     void on_action_send_to_printer(bool isall = false);
     void on_action_send_to_multi_machine(SimpleEvent&);
+    void on_action_send_to_bambu_connect(SimpleEvent&);
     int update_print_required_data(Slic3r::DynamicPrintConfig config, Slic3r::Model model, Slic3r::PlateDataPtrs plate_data_list, std::string file_name, std::string file_path);
 private:
     bool layers_height_allowed() const;
@@ -5250,6 +5251,7 @@ Plater::priv::priv(Plater *q, MainFrame *main_frame)
         q->Bind(EVT_GLTOOLBAR_SEND_TO_PRINTER, &priv::on_action_export_to_sdcard, this);
         q->Bind(EVT_GLTOOLBAR_SEND_TO_PRINTER_ALL, &priv::on_action_export_to_sdcard_all, this);
         q->Bind(EVT_GLTOOLBAR_PRINT_MULTI_MACHINE, &priv::on_action_send_to_multi_machine, this);
+        q->Bind(EVT_GLTOOLBAR_SEND_TO_BAMBU_CONNECT, &priv::on_action_send_to_bambu_connect, this);
         q->Bind(EVT_GLCANVAS_PLATE_SELECT, &priv::on_plate_selected, this);
         q->Bind(EVT_DOWNLOAD_PROJECT, &priv::on_action_download_project, this);
         q->Bind(EVT_IMPORT_MODEL_ID, &priv::on_action_request_model_id, this);
@@ -10076,6 +10078,14 @@ void Plater::priv::on_action_send_to_printer(bool isall)
 	m_send_to_sdcard_dlg->ShowModal();
 }
 
+void Plater::priv::on_action_send_to_bambu_connect(SimpleEvent&)
+{
+    if (q != nullptr) {
+        BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << ":received send to bambu connect event\n";
+        q->send_to_bambu_connect();
+    }
+}
+
 
 void Plater::priv::on_action_select_sliced_plate(wxCommandEvent &evt)
 {
@@ -14716,6 +14726,117 @@ void Plater::export_gcode(bool prefer_removable)
 void Plater::send_to_printer(bool isall)
 {
     p->on_action_send_to_printer(isall);
+}
+
+// ORCA: Hand sliced gcode.3mf to Bambu Connect via its custom URL scheme.
+// Bambu Connect (https://wiki.bambulab.com/en/software/bambu-connect) registers a
+// `bambu-connect://import-file?path=...&name=...&version=1.0.0` handler at the OS
+// level; passing it the path to a freshly-exported .gcode.3mf lets Bambu's signed
+// app forward the print to the printer/cloud, sidestepping the third-party
+// signed-network restriction introduced by firmware 1.08.03.00.
+void Plater::send_to_bambu_connect()
+{
+    if (p->model.objects.empty())
+        return;
+
+    if (p->process_completed_with_error == p->partplate_list.get_curr_plate_index())
+        return;
+
+    // Make sure the slice is current before exporting.
+    try {
+        unsigned int state = this->p->update_restart_background_process(false, false);
+        if (state & priv::UPDATE_BACKGROUND_PROCESS_INVALID)
+            return;
+    } catch (const Slic3r::PlaceholderParserError& ex) {
+        show_error(this, ex.what(), true);
+        return;
+    } catch (const std::exception& ex) {
+        show_error(this, ex.what(), false);
+        return;
+    }
+
+    // Build a stable per-session temp path: <tempdir>/OrcaSlicer/BambuConnect/<name>.gcode.3mf
+    fs::path temp_dir;
+    try {
+        temp_dir = fs::path(wxStandardPaths::Get().GetTempDir().utf8_str().data())
+                   / "OrcaSlicer" / "BambuConnect";
+        fs::create_directories(temp_dir);
+    } catch (const std::exception& ex) {
+        show_error(this, _L("Failed to prepare temporary directory for Bambu Connect: ") + from_u8(ex.what()), false);
+        return;
+    }
+
+    wxString filename_only = p->get_export_gcode_filename(".gcode.3mf", true, false);
+    if (filename_only.IsEmpty())
+        filename_only = "plate.gcode.3mf";
+
+    // Sanitise the filename to ASCII to avoid filesystem/URL encoding pitfalls in the temp path.
+    std::string filename_ascii = Slic3r::fold_utf8_to_ascii(into_u8(filename_only));
+    if (filename_ascii.empty())
+        filename_ascii = "plate.gcode.3mf";
+    fs::path output_path = temp_dir / filename_ascii;
+
+    int plate_idx = get_partplate_list().get_curr_plate_index();
+
+    p->notification_manager->new_export_began(false);
+    p->exporting_status = ExportingStatus::EXPORTING_TO_LOCAL;
+
+    int rc = export_3mf(output_path,
+                        SaveStrategy::Silence | SaveStrategy::SplitModel | SaveStrategy::WithGcode | SaveStrategy::SkipModel,
+                        plate_idx);
+    if (rc < 0 || !fs::exists(output_path)) {
+        show_error(this, _L("Failed to export sliced file for Bambu Connect."), false);
+        return;
+    }
+
+    // Display name for Bambu Connect's UI: prefer the project name without extension.
+    wxString display_name = p->get_project_name();
+    if (display_name.IsEmpty())
+        display_name = wxString::FromUTF8(fs::path(filename_ascii).stem().string());
+
+    // RFC 3986 percent-encoding of the display name (UTF-8 bytes).
+    auto percent_encode = [](const std::string& s) {
+        static const char hex[] = "0123456789ABCDEF";
+        std::string out;
+        out.reserve(s.size() * 3);
+        for (unsigned char c : s) {
+            const bool unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+                                    || (c >= '0' && c <= '9')
+                                    || c == '-' || c == '_' || c == '.' || c == '~';
+            if (unreserved) {
+                out.push_back(static_cast<char>(c));
+            } else {
+                out.push_back('%');
+                out.push_back(hex[(c >> 4) & 0xF]);
+                out.push_back(hex[c & 0xF]);
+            }
+        }
+        return out;
+    };
+
+    // Bambu Connect documents path as plain absolute filesystem path. Percent-encode anyway
+    // so embedded spaces / unicode in the temp dir don't break URL parsing.
+    std::string url = "bambu-connect://import-file?path="
+                      + percent_encode(output_path.generic_string())
+                      + "&name=" + percent_encode(into_u8(display_name))
+                      + "&version=1.0.0";
+
+    BOOST_LOG_TRIVIAL(info) << "send_to_bambu_connect: launching " << url;
+
+    if (!wxLaunchDefaultBrowser(wxString::FromUTF8(url.c_str()))) {
+        wxString msg = _L("Could not launch Bambu Connect. Make sure Bambu Connect is installed.")
+                       + "\n\n"
+                       + _L("You can download it from:") + "\n"
+                       + "https://bambulab.com/en/download/bambu-connect";
+        wxMessageDialog dlg(this, msg, _L("Send to Bambu Connect"), wxOK | wxICON_WARNING);
+        dlg.ShowModal();
+        return;
+    }
+
+    p->notification_manager->push_exporting_finished_notification(
+        output_path.string(),
+        output_path.parent_path().string(),
+        false);
 }
 
 //BBS export gcode 3mf to file
