@@ -1918,6 +1918,10 @@ wxBoxSizer* MainFrame::create_side_tools()
                 wxPostEvent(m_plater, SimpleEvent(EVT_GLTOOLBAR_SEND_TO_PRINTER));
             else if (m_print_select == eSendToPrinterAll)
                 wxPostEvent(m_plater, SimpleEvent(EVT_GLTOOLBAR_SEND_TO_PRINTER_ALL));
+            else if (m_print_select == eSendToBambuConnect)
+                wxPostEvent(m_plater, SimpleEvent(EVT_GLTOOLBAR_SEND_TO_BAMBU_CONNECT));
+            else if (m_print_select == eSendToBambuConnectAll)
+                wxPostEvent(m_plater, SimpleEvent(EVT_GLTOOLBAR_SEND_TO_BAMBU_CONNECT_ALL));
             /* else if (m_print_select == ePrintMultiMachine)
                  wxPostEvent(m_plater, SimpleEvent(EVT_GLTOOLBAR_PRINT_MULTI_MACHINE));*/
         });
@@ -2112,6 +2116,34 @@ wxBoxSizer* MainFrame::create_side_tools()
                     });
                     p->append_button(print_multi_machine_btn);
                 }
+
+                // ORCA Bambu Connect handoff for users hit by signed-network restrictions
+                SideButton* send_to_bambu_connect_btn = new SideButton(p, _L("Send to Bambu Connect"), "");
+                send_to_bambu_connect_btn->SetCornerRadius(0);
+                send_to_bambu_connect_btn->Bind(wxEVT_BUTTON, [this, p](wxCommandEvent&) {
+                    m_print_btn->SetLabel(_L("Send to Bambu Connect"));
+                    m_print_select = eSendToBambuConnect;
+                    m_print_enable = get_enable_print_status();
+                    m_print_btn->Enable(m_print_enable);
+                    this->Layout();
+                    fit_tab_labels(); // ORCA on label change
+                    p->Dismiss();
+                });
+                p->append_button(send_to_bambu_connect_btn);
+
+                SideButton* send_to_bambu_connect_all_btn = new SideButton(p, _L("Send all to Bambu Connect"), "");
+                send_to_bambu_connect_all_btn->SetCornerRadius(0);
+                send_to_bambu_connect_all_btn->Bind(wxEVT_BUTTON, [this, p](wxCommandEvent&) {
+                    m_print_btn->SetLabel(_L("Send all to Bambu Connect"));
+                    m_print_select = eSendToBambuConnectAll;
+                    m_print_enable = get_enable_print_status();
+                    m_print_btn->Enable(m_print_enable);
+                    this->Layout();
+                    fit_tab_labels(); // ORCA on label change
+                    p->Dismiss();
+                });
+                p->append_button(send_to_bambu_connect_all_btn);
+
                 p->append_button(export_sliced_file_btn);
                 p->append_button(export_all_sliced_file_btn);
                 SideButton* export_gcode_btn = new SideButton(p, _L("Export G-code file"), "");
@@ -2274,6 +2306,24 @@ bool MainFrame::get_enable_print_status()
             enable = false;
         }
         enable = enable && !is_all_plates;
+    }
+    else if (m_print_select == eSendToBambuConnect)
+    {
+        // Must match the same gating as eSendToPrinter so a freshly-opened
+        // 3MF with stale/absent slice data can't be handed to Bambu Connect
+        // (produces a partial .gcode.3mf that BC stalls on during import).
+        if (!current_plate->is_slice_result_ready_for_print())
+        {
+            enable = false;
+        }
+        enable = enable && !is_all_plates;
+    }
+    else if (m_print_select == eSendToBambuConnectAll)
+    {
+        if (!part_plate_list.is_all_slice_results_ready_for_print())
+        {
+            enable = false;
+        }
     }
 
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": m_print_select %1%, enable= %2% ")%m_print_select %enable;
