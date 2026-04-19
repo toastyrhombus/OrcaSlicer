@@ -4792,6 +4792,7 @@ struct Plater::priv
     void on_action_send_to_printer(bool isall = false);
     void on_action_send_to_multi_machine(SimpleEvent&);
     void on_action_send_to_bambu_connect(SimpleEvent&);
+    void on_action_send_to_bambu_connect_all(SimpleEvent&);
     int update_print_required_data(Slic3r::DynamicPrintConfig config, Slic3r::Model model, Slic3r::PlateDataPtrs plate_data_list, std::string file_name, std::string file_path);
 private:
     bool layers_height_allowed() const;
@@ -5252,6 +5253,7 @@ Plater::priv::priv(Plater *q, MainFrame *main_frame)
         q->Bind(EVT_GLTOOLBAR_SEND_TO_PRINTER_ALL, &priv::on_action_export_to_sdcard_all, this);
         q->Bind(EVT_GLTOOLBAR_PRINT_MULTI_MACHINE, &priv::on_action_send_to_multi_machine, this);
         q->Bind(EVT_GLTOOLBAR_SEND_TO_BAMBU_CONNECT, &priv::on_action_send_to_bambu_connect, this);
+        q->Bind(EVT_GLTOOLBAR_SEND_TO_BAMBU_CONNECT_ALL, &priv::on_action_send_to_bambu_connect_all, this);
         q->Bind(EVT_GLCANVAS_PLATE_SELECT, &priv::on_plate_selected, this);
         q->Bind(EVT_DOWNLOAD_PROJECT, &priv::on_action_download_project, this);
         q->Bind(EVT_IMPORT_MODEL_ID, &priv::on_action_request_model_id, this);
@@ -10082,7 +10084,15 @@ void Plater::priv::on_action_send_to_bambu_connect(SimpleEvent&)
 {
     if (q != nullptr) {
         BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << ":received send to bambu connect event\n";
-        q->send_to_bambu_connect();
+        q->send_to_bambu_connect(false);
+    }
+}
+
+void Plater::priv::on_action_send_to_bambu_connect_all(SimpleEvent&)
+{
+    if (q != nullptr) {
+        BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << ":received send all to bambu connect event\n";
+        q->send_to_bambu_connect(true);
     }
 }
 
@@ -14734,7 +14744,10 @@ void Plater::send_to_printer(bool isall)
 // level; passing it the path to a freshly-exported .gcode.3mf lets Bambu's signed
 // app forward the print to the printer/cloud, sidestepping the third-party
 // signed-network restriction introduced by firmware 1.08.03.00.
-void Plater::send_to_bambu_connect()
+//
+// When `isall` is true the full multi-plate .gcode.3mf is exported; Bambu Connect
+// ingests the same multi-plate format Bambu Studio uses for "Print all plates".
+void Plater::send_to_bambu_connect(bool isall)
 {
     if (p->model.objects.empty())
         return;
@@ -14766,17 +14779,32 @@ void Plater::send_to_bambu_connect()
         return;
     }
 
-    wxString filename_only = p->get_export_gcode_filename(".gcode.3mf", true, false);
+    // Temp-file hygiene: sweep anything in our handoff dir older than 7 days so we
+    // don't silently leak disk if the user sends repeatedly. Failure here is non-fatal.
+    try {
+        const auto cutoff = std::time(nullptr) - 7 * 24 * 60 * 60;
+        for (auto it = fs::directory_iterator(temp_dir); it != fs::directory_iterator(); ++it) {
+            boost::system::error_code ec;
+            if (fs::is_regular_file(it->path(), ec)
+                && fs::last_write_time(it->path(), ec) < cutoff) {
+                fs::remove(it->path(), ec);
+            }
+        }
+    } catch (const std::exception& ex) {
+        BOOST_LOG_TRIVIAL(warning) << "send_to_bambu_connect: temp cleanup failed: " << ex.what();
+    }
+
+    wxString filename_only = p->get_export_gcode_filename(".gcode.3mf", true, isall);
     if (filename_only.IsEmpty())
-        filename_only = "plate.gcode.3mf";
+        filename_only = isall ? "all_plates.gcode.3mf" : "plate.gcode.3mf";
 
     // Sanitise the filename to ASCII to avoid filesystem/URL encoding pitfalls in the temp path.
     std::string filename_ascii = Slic3r::fold_utf8_to_ascii(into_u8(filename_only));
     if (filename_ascii.empty())
-        filename_ascii = "plate.gcode.3mf";
+        filename_ascii = isall ? "all_plates.gcode.3mf" : "plate.gcode.3mf";
     fs::path output_path = temp_dir / filename_ascii;
 
-    int plate_idx = get_partplate_list().get_curr_plate_index();
+    const int plate_idx = isall ? PLATE_ALL_IDX : get_partplate_list().get_curr_plate_index();
 
     p->notification_manager->new_export_began(false);
     p->exporting_status = ExportingStatus::EXPORTING_TO_LOCAL;
@@ -14785,6 +14813,9 @@ void Plater::send_to_bambu_connect()
                         SaveStrategy::Silence | SaveStrategy::SplitModel | SaveStrategy::WithGcode | SaveStrategy::SkipModel,
                         plate_idx);
     if (rc < 0 || !fs::exists(output_path)) {
+        // Best-effort cleanup of a half-written file so the next run starts clean.
+        boost::system::error_code ec;
+        fs::remove(output_path, ec);
         show_error(this, _L("Failed to export sliced file for Bambu Connect."), false);
         return;
     }
