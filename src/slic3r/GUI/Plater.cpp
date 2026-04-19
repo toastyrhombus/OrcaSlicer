@@ -14755,6 +14755,21 @@ void Plater::send_to_bambu_connect(bool isall)
     if (p->process_completed_with_error == p->partplate_list.get_curr_plate_index())
         return;
 
+    // Guard against exporting stale/partial slice data — a freshly-opened 3MF
+    // shows cached visuals but the in-memory print state isn't yet reconstituted,
+    // and a .gcode.3mf written now would stall Bambu Connect during import.
+    const bool slices_ready = isall
+        ? p->partplate_list.is_all_slice_results_ready_for_print()
+        : p->partplate_list.get_curr_plate()->is_slice_result_ready_for_print();
+    if (!slices_ready) {
+        wxMessageDialog dlg(this,
+            _L("Please slice the plate(s) before sending to Bambu Connect."),
+            _L("Send to Bambu Connect"),
+            wxOK | wxICON_INFORMATION);
+        dlg.ShowModal();
+        return;
+    }
+
     // Make sure the slice is current before exporting.
     try {
         unsigned int state = this->p->update_restart_background_process(false, false);

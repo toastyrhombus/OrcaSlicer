@@ -2307,6 +2307,24 @@ bool MainFrame::get_enable_print_status()
         }
         enable = enable && !is_all_plates;
     }
+    else if (m_print_select == eSendToBambuConnect)
+    {
+        // Must match the same gating as eSendToPrinter so a freshly-opened
+        // 3MF with stale/absent slice data can't be handed to Bambu Connect
+        // (produces a partial .gcode.3mf that BC stalls on during import).
+        if (!current_plate->is_slice_result_ready_for_print())
+        {
+            enable = false;
+        }
+        enable = enable && !is_all_plates;
+    }
+    else if (m_print_select == eSendToBambuConnectAll)
+    {
+        if (!part_plate_list.is_all_slice_results_ready_for_print())
+        {
+            enable = false;
+        }
+    }
 
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": m_print_select %1%, enable= %2% ")%m_print_select %enable;
 
